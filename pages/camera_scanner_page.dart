@@ -1,28 +1,22 @@
-// lib/pages/camera_scanner_page.dart
-// ignore_for_file: use_build_context_synchronously
-
 import 'dart:async';
-import 'dart:convert';
-import 'dart:io'; // Para File e XFile
+import 'dart:io';
 import 'dart:math';
-import 'package:corretor_provas/components/selecionar_aluno_dialog.dart';
-import 'package:flutter/foundation.dart';
-import 'package:flutter/material.dart';
-import 'package:camera/camera.dart';
-import 'package:mobile_scanner/mobile_scanner.dart';
-import 'package:http/http.dart' as http; // Para chamadas de API
-import 'package:http_parser/http_parser.dart'; // Para MediaType
 
+import 'package:camera/camera.dart';
+import 'package:flutter/material.dart';
+import 'package:mobile_scanner/mobile_scanner.dart';
+
+import '../components/selecionar_aluno_dialog.dart';
 import '../models/aluno.dart';
 import '../models/prova.dart';
-// REMOVIDO: import 'package:corretor_provas/scanner/omr_processor.dart';
+import '../scanner/scan_contract.dart';
 import '../services/aluno_service.dart';
+import '../services/omr_service.dart';
 import '../services/prova_service.dart';
 import '../services/resultado_service.dart';
-// Mantido para validar as respostas recebidas da API
-import 'package:corretor_provas/utils/validator.dart'; // LINHA CORRIGIDA
+import '../utils/validator.dart';
 
-enum ScannerStage { scanningQrCode, processingQrCode, scanningOmr }
+enum ScannerStage { starting, qr, loading, sheet, review }
 
 class CameraScannerPage extends StatefulWidget {
   const CameraScannerPage({super.key});
@@ -30,621 +24,529 @@ class CameraScannerPage extends StatefulWidget {
   CameraScannerPageState createState() => CameraScannerPageState();
 }
 
-class CameraScannerPageState extends State<CameraScannerPage> {
-  // URL da sua API no Google Cloud Run
-  final String _apiUrl =
-      "https://omr-scanner-service-61890940348.southamerica-east1.run.app/processar";
+class CameraScannerPageState extends State<CameraScannerPage>
+    with WidgetsBindingObserver {
+  final _qr = MobileScannerController(autoStart: false);
+  final _omr = OmrService();
+  final _provas = ProvaService();
+  final _alunos = AlunoService();
+  final _resultados = ResultadoService();
+  CameraController? _camera;
+  Future<void> _cameraQueue = Future<void>.value();
+  ScannerStage _stage = ScannerStage.starting;
+  String _status = 'Preparando câmera…';
+  bool _busy = false;
+  bool _foreground = true;
+  bool _reviewing = false;
+  bool _torch = false;
+  int _generation = 0;
+  Prova? _prova;
+  Aluno? _aluno;
 
-  final MobileScannerController _qrScannerController =
-      MobileScannerController();
-  CameraController? _omrCameraController;
-  final ProvaService _provaService = ProvaService();
-  final AlunoService _alunoService = AlunoService();
-  final ResultadoService _resultadoService = ResultadoService();
-  ScannerStage _currentStage = ScannerStage.scanningQrCode;
-  String _statusMessage = "Aponte para o QR Code da prova";
-  bool _isProcessing = false; // Bloqueia múltiplas capturas
-  Prova? _provaEscaneada;
-  Aluno? _alunoEscaneado;
-  int _expectedPage = 1;
-  int _totalPages = 0;
-  final Map<int, List<int>> _sessionAnswers =
-      {}; // Armazena respostas por página
-  FlashMode _currentFlashMode = FlashMode.off;
+  bool _current(int generation) =>
+      mounted && _foreground && generation == _generation;
 
-  // REMOVIDAS: Variáveis de estado do processamento de stream
-  // _lastFrameProcessingTime, _isCoolingDown, _markersDetected, _previousCorners, _stableFrames
+  // QR and photo capture share the same hardware. Never open both at once.
+  Future<void> _serializeCamera(Future<void> Function() action) {
+    final operation = _cameraQueue.then((_) => action());
+    _cameraQueue = operation.catchError((Object _) {});
+    return operation;
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    WidgetsBinding.instance.addPostFrameCallback((_) => _reset());
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      _foreground = true;
+      if (!_reviewing) unawaited(_reset());
+    } else if (state == AppLifecycleState.inactive ||
+        state == AppLifecycleState.paused ||
+        state == AppLifecycleState.detached) {
+      _foreground = false;
+      ++_generation;
+      _omr.cancel();
+      unawaited(_serializeCamera(_releaseCameras).catchError((Object _) {}));
+    }
+  }
 
   @override
   void dispose() {
-    _qrScannerController.dispose();
-    _omrCameraController?.dispose();
+    WidgetsBinding.instance.removeObserver(this);
+    ++_generation;
+    _omr.cancel();
+    unawaited(
+      _serializeCamera(() async {
+        await _releaseCameras();
+        await _qr.dispose();
+      }).catchError((Object _) {}),
+    );
     super.dispose();
   }
 
-  Future<void> _toggleFlash() async {
-    if (_omrCameraController == null ||
-        !_omrCameraController!.value.isInitialized)
-      return;
-
-    final newFlashMode = _currentFlashMode == FlashMode.off
-        ? FlashMode.torch
-        : FlashMode.off;
+  Future<void> _releaseCameras() async {
+    final camera = _camera;
+    _camera = null;
     try {
-      await _omrCameraController!.setFlashMode(newFlashMode);
-      if (mounted) {
-        setState(() => _currentFlashMode = newFlashMode);
-      }
-    } catch (e) {
-      debugPrint("Erro ao mudar modo de flash: $e");
+      await _qr.stop();
+    } finally {
+      await camera?.dispose();
     }
   }
 
-  void _onQrCodeDetected(BarcodeCapture capture) async {
-    if (_isProcessing || _currentStage != ScannerStage.scanningQrCode) return;
-    final Barcode? barcode = capture.barcodes.firstOrNull;
-    if (barcode != null && barcode.rawValue != null) {
-      setState(() {
-        _isProcessing = true;
-        _currentStage = ScannerStage.processingQrCode;
-        _statusMessage = "QR Code detectado! Validando...";
+  String _error(Object error) {
+    if (error is OmrException) return error.message;
+    if (error is FormatException) return error.message;
+    if (error is TimeoutException)
+      return 'A consulta demorou demais. Tente novamente.';
+    if (error is CameraException && error.code.contains('Access')) {
+      return 'Permita o acesso à câmera nas configurações do celular.';
+    }
+    return 'Não foi possível concluir a operação. Verifique a conexão e tente novamente.';
+  }
+
+  Future<void> _reset({String? message}) async {
+    if (!mounted || !_foreground || _reviewing) return;
+    final generation = ++_generation;
+    _omr.cancel();
+    setState(() {
+      _stage = ScannerStage.starting;
+      _busy = true;
+      _prova = null;
+      _aluno = null;
+      _torch = false;
+      _status = message ?? 'Aponte para o QR Code da folha';
+    });
+    try {
+      await _serializeCamera(() async {
+        await _releaseCameras();
+        if (_current(generation)) await _qr.start();
       });
-      try {
-        final data = jsonDecode(barcode.rawValue!) as Map<String, dynamic>;
-        final provaId = data['provaId'] as String?;
-        final alunoId = data['alunoId'] as String?;
-        final turmaId = data['turmaId'] as String?;
-        final totalPages = data['totalPages'] as int?;
-        if (provaId == null || totalPages == null) {
-          throw Exception("QR Code inválido: Faltam informações da prova.");
-        }
+      if (!_current(generation)) return;
+      setState(() {
+        _stage = ScannerStage.qr;
+        _busy = false;
+      });
+    } catch (error) {
+      if (!_current(generation)) return;
+      setState(() {
+        _busy = false;
+        _status = _error(error);
+      });
+    }
+  }
 
-        final provaFuture = _provaService.getProvaById(provaId);
-        final alunoFuture = (alunoId != null && turmaId != null)
-            ? _alunoService.getAlunoById(turmaId, alunoId)
-            : Future.value(null);
-
-        final results = await Future.wait([provaFuture, alunoFuture]);
-        _provaEscaneada = results[0] as Prova?;
-        _alunoEscaneado = results[1] as Aluno?;
-
-        if (_provaEscaneada == null) {
-          throw Exception("Prova com ID '$provaId' não encontrada.");
-        }
-
-        _totalPages = totalPages;
-        _expectedPage = 1;
-        _sessionAnswers.clear();
-        await _initializeOmrCamera();
-      } catch (e) {
-        _resetScanner(
-          errorMessage: "Erro: ${e.toString().replaceAll("Exception: ", "")}",
+  Future<void> _onQr(BarcodeCapture capture) async {
+    if (_busy || _stage != ScannerStage.qr || !_foreground) return;
+    final codes = capture.barcodes.where((code) => code.rawValue != null);
+    if (codes.isEmpty) return;
+    final generation = ++_generation;
+    setState(() {
+      _busy = true;
+      _stage = ScannerStage.loading;
+      _status = 'Conferindo a prova…';
+    });
+    try {
+      await _serializeCamera(() async => _qr.stop());
+      if (!_current(generation)) return;
+      final sheet = ScanSheet.parse(codes.first.rawValue!);
+      final prova = await _provas
+          .getProvaById(sheet.provaId)
+          .timeout(const Duration(seconds: 20));
+      if (!_current(generation)) return;
+      if (prova == null) throw const FormatException('Prova não encontrada.');
+      sheet.questionsOnSheet(prova.numeroQuestoes);
+      if (prova.gabarito.length != prova.numeroQuestoes ||
+          prova.gabarito.any((answer) => answer < 0 || answer > 4)) {
+        throw const FormatException(
+          'Revise o gabarito da prova antes de escanear.',
         );
       }
-    }
-  }
-
-  Future<void> _initializeOmrCamera() async {
-    final cameras = await availableCameras();
-    if (cameras.isEmpty) {
-      _resetScanner(errorMessage: "Nenhuma câmera encontrada.");
-      return;
-    }
-
-    ResolutionPreset resolution =
-        ResolutionPreset.high; // Captura em alta resolução
-
-    try {
-      _omrCameraController = CameraController(
-        cameras[0],
-        resolution,
-        enableAudio: false,
-        imageFormatGroup: ImageFormatGroup.jpeg, // Pede JPEG para takePicture
-      );
-      await _omrCameraController!.initialize();
-    } catch (e) {
-      debugPrint("Falha ao inicializar câmera: $e");
-      // Tenta fallback para YUV (pode ser mais lento para takePicture)
-      try {
-        _omrCameraController = CameraController(
-          cameras[0],
-          resolution,
+      Aluno? aluno;
+      if (sheet.alunoId != null) {
+        aluno = await _alunos
+            .getAlunoById(sheet.turmaId!, sheet.alunoId!)
+            .timeout(const Duration(seconds: 20));
+        if (!_current(generation)) return;
+        if (aluno == null)
+          throw const FormatException('Aluno da folha não encontrado.');
+      }
+      _prova = prova;
+      _aluno = aluno;
+      await _serializeCamera(() async {
+        if (!_current(generation)) return;
+        final cameras = await availableCameras();
+        if (!_current(generation)) return;
+        if (cameras.isEmpty)
+          throw const FormatException('Nenhuma câmera disponível.');
+        final back = cameras.where(
+          (c) => c.lensDirection == CameraLensDirection.back,
+        );
+        final controller = CameraController(
+          back.isEmpty ? cameras.first : back.first,
+          ResolutionPreset.high,
           enableAudio: false,
-          imageFormatGroup: ImageFormatGroup.yuv420,
         );
-        await _omrCameraController!.initialize();
-      } catch (fallbackError) {
-        debugPrint("Falha ao inicializar com YUV420. Erro: $fallbackError");
-        _resetScanner(errorMessage: "Erro fatal ao iniciar câmera.");
-        return;
-      }
-    }
-
-    if (!mounted) return;
-    await _omrCameraController!.setFlashMode(FlashMode.off);
-    setState(() => _currentFlashMode = FlashMode.off);
-
-    // REMOVIDO: _omrCameraController!.startImageStream(_processOmrImage);
-    // A câmera está pronta para o preview e para takePicture()
-
-    setState(() {
-      _currentStage = ScannerStage.scanningOmr;
-      _statusMessage = "Posicione a Página 1 de $_totalPages";
-      _isProcessing = false;
-    });
-  }
-
-  // --- FUNÇÕES DE PROCESSAMENTO DE STREAM REMOVIDAS ---
-  // REMOVIDO: _processOmrImage(CameraImage image)
-  // REMOVIDO: _findCornersForStability(CameraImage image)
-  // REMOVIDO: _triggerOMRProcessing(CameraImage image)
-
-  // --- NOVAS FUNÇÕES DE CAPTURA E CHAMADA DE API ---
-
-  /// Chamado quando o botão de captura é pressionado.
-  Future<void> _onCapturePressed() async {
-    if (_isProcessing ||
-        _omrCameraController == null ||
-        !_omrCameraController!.value.isInitialized) {
-      return;
-    }
-
-    setState(() {
-      _isProcessing = true;
-      _statusMessage = "Capturando foto...";
-    });
-
-    XFile? pictureFile;
-    try {
-      // 1. Tira a Foto
-      pictureFile = await _omrCameraController!.takePicture();
-
-      setState(() {
-        _statusMessage = "Foto capturada! Enviando para análise...";
-      });
-
-      // 2. Envia para a API
-      final List<int>? answers = await _sendImageToApi(pictureFile);
-
-      if (!mounted) return;
-
-      // 3. Processa a Resposta
-      if (answers != null && answers.isNotEmpty) {
-        _sessionAnswers[_expectedPage] = answers;
-
-        if (_expectedPage < _totalPages) {
-          // Mais páginas para escanear
-          setState(() {
-            _expectedPage++;
-            _statusMessage =
-                "✅ Página ${_expectedPage - 1} lida! Posicione a Página $_expectedPage.";
-            _isProcessing = false;
-            // Adiciona um pequeno cooldown
-          });
-        } else {
-          // Última página, compila resultados
-          final List<int> allAnswers = [];
-          final int questionsPerPage =
-              (_provaEscaneada!.numeroQuestoes / _totalPages).ceil();
-
-          for (int i = 1; i <= _totalPages; i++) {
-            allAnswers.addAll(
-              _sessionAnswers[i] ?? List.filled(questionsPerPage, -1),
-            );
+        try {
+          await controller.initialize();
+          if (!_current(generation)) {
+            await controller.dispose();
+            return;
           }
-          // Garante o tamanho correto
-          while (allAnswers.length < _provaEscaneada!.numeroQuestoes) {
-            allAnswers.add(-1);
+          _camera = controller;
+          // Some devices do not support flash. That must not block scanning.
+          try {
+            await controller.setFlashMode(FlashMode.off);
+          } on CameraException {
+            /* optional */
           }
-          if (allAnswers.length > _provaEscaneada!.numeroQuestoes) {
-            allAnswers.removeRange(
-              _provaEscaneada!.numeroQuestoes,
-              allAnswers.length,
-            );
-          }
-
-          setState(
-            () => _statusMessage = "Sucesso! Exibindo resultado final...",
-          );
-          _mostrarResultados(
-            allAnswers,
-            pictureFile.path,
-          ); // Passa o path local
+        } catch (_) {
+          if (identical(_camera, controller)) _camera = null;
+          await controller.dispose();
+          rethrow;
         }
-      } else {
-        // API falhou ou não retornou respostas
-        setState(() {
-          _statusMessage = "Falha na análise da API. Tente novamente.";
-          _isProcessing = false;
-        });
-      }
-    } catch (e) {
-      // Erro ao tirar foto ou na chamada da API
-      debugPrint("Erro em _onCapturePressed: $e");
-      if (mounted) {
-        setState(() {
-          _statusMessage = "Erro: ${e.toString()}. Tente novamente.";
-          _isProcessing = false;
-        });
-      }
+      });
+      if (!_current(generation)) return;
+      setState(() {
+        _stage = ScannerStage.sheet;
+        _busy = false;
+        _status = 'Enquadre a folha inteira, incluindo os quatro cantos';
+      });
+    } catch (error) {
+      if (_current(generation)) await _reset(message: _error(error));
     }
   }
 
-  /// Envia a imagem capturada para a API Python no Cloud Run.
-  Future<List<int>?> _sendImageToApi(XFile imageFile) async {
+  Future<void> _capture() async {
+    final camera = _camera;
+    final prova = _prova;
+    if (_busy || camera == null || prova == null || !camera.value.isInitialized)
+      return;
+    final generation = _generation;
+    setState(() {
+      _busy = true;
+      _status = 'Fotografando…';
+    });
+    XFile? photo;
+    var enteredReview = false;
     try {
-      final uri = Uri.parse(_apiUrl);
-      var request = http.MultipartRequest('POST', uri);
-
-      // Calcula o número de questões para esta página específica
-      final int maxQuestionsPerPage = 25; // Sincronizado com o Python
-      final int questoesPaginaAnterior =
-          (_expectedPage - 1) * maxQuestionsPerPage;
-      final int questionsOnThisPage = min(
-        maxQuestionsPerPage,
-        _provaEscaneada!.numeroQuestoes - questoesPaginaAnterior,
-      );
-
-      // Adiciona campos de formulário (ex: número de questões)
-      request.fields['expected_questions'] = questionsOnThisPage.toString();
-      // (Você pode adicionar mais campos se a API precisar, ex: 'page_number')
-
-      // Adiciona o ficheiro de imagem
-      request.files.add(
-        await http.MultipartFile.fromPath(
-          'file', // Nome do campo esperado pelo servidor Flask/Python
-          imageFile.path,
-          contentType: MediaType('image', 'jpeg'),
-        ),
-      );
-
-      debugPrint("Enviando imagem para API ($questionsOnThisPage questões)...");
-
-      // Envia a requisição
-      final response = await request.send();
-
-      // Lê a resposta
-      final responseBody = await response.stream.bytesToString();
-
-      if (response.statusCode == 200) {
-        // Sucesso
-        final jsonResponse = jsonDecode(responseBody);
-        List<int> answers = (jsonResponse['answers'] as List).cast<int>();
-        debugPrint("API retornou sucesso. Respostas: $answers");
-        return answers;
-      } else {
-        // Erro do servidor
-        debugPrint(
-          "Falha na API: ${response.statusCode}. Resposta: $responseBody",
-        );
-        return null;
+      photo = await camera.takePicture();
+      if (!_current(generation)) return;
+      setState(() => _status = 'Lendo as ${prova.numeroQuestoes} questões…');
+      final answers = await _omr.scan(photo.path, prova.numeroQuestoes);
+      if (!_current(generation)) return;
+      _reviewing = true;
+      enteredReview = true;
+      setState(() => _stage = ScannerStage.review);
+      await _serializeCamera(_releaseCameras);
+      if (!mounted || !_foreground) return;
+      await _reviewAndSave(prova, answers, photo.path);
+    } catch (error) {
+      if (_current(generation)) {
+        setState(() {
+          _status = _error(error);
+          _busy = false;
+        });
       }
-    } catch (e) {
-      debugPrint("Erro de rede/http ao chamar API: $e");
-      return null;
+    } finally {
+      // The upload completes before cleanup; temporary photos do not accumulate.
+      if (photo != null) {
+        try {
+          await File(photo.path).delete();
+        } on FileSystemException {
+          /* already removed */
+        }
+      }
+      if (enteredReview) {
+        _reviewing = false;
+        if (mounted && _foreground) await _reset();
+      }
     }
   }
 
-  // --- Funções de Resultado e Reset (Quase inalteradas) ---
-
-  void _mostrarResultados(List<int> resultados, String? imagePath) {
-    final gabaritoOficial = (_provaEscaneada!.gabarito as List<dynamic>)
-        .cast<int>();
-    final validacao = GabaritoValidator.validarRespostas(
-      respostasDetectadas: resultados,
-      gabaritoOficial: gabaritoOficial,
-      numQuestoes: _provaEscaneada!.numeroQuestoes,
-    );
-    showDialog(
-      context: context,
-      barrierDismissible: false,
-      builder: (context) => AlertDialog(
-        title: const Text('Resultados da Correção'),
-        content: SingleChildScrollView(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text('Prova: ${_provaEscaneada!.titulo}'),
-              if (_alunoEscaneado != null)
-                Text('Aluno: ${_alunoEscaneado!.nome}'),
-              const SizedBox(height: 8),
-              Text(
-                'Acertos: ${validacao.acertos} | Nota: ${validacao.nota.toStringAsFixed(1)}/10',
-                style: Theme.of(
-                  context,
-                ).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.bold),
-              ),
-              if (imagePath != null)
-                Padding(
-                  padding: const EdgeInsets.only(top: 16.0),
-                  child: Text(
-                    "Imagem salva localmente (para debug): $imagePath",
-                    style: Theme.of(context).textTheme.bodySmall,
+  Future<void> _reviewAndSave(
+    Prova prova,
+    List<int> detected,
+    String path,
+  ) async {
+    final answers = List<int>.from(detected);
+    while (mounted) {
+      final save = await showDialog<bool>(
+        context: context,
+        barrierDismissible: false,
+        builder: (dialogContext) => StatefulBuilder(
+          builder: (context, refresh) {
+            final grade = GabaritoValidator.validarRespostas(
+              respostasDetectadas: answers,
+              gabaritoOficial: prova.gabarito,
+              numQuestoes: prova.numeroQuestoes,
+            );
+            return AlertDialog(
+              title: const Text('Confira a leitura'),
+              content: SizedBox(
+                width: 420,
+                child: SingleChildScrollView(
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(prova.titulo),
+                      if (_aluno != null) Text('Aluno: ${_aluno!.nome}'),
+                      const SizedBox(height: 12),
+                      Image.file(File(path), height: 150, fit: BoxFit.contain),
+                      const SizedBox(height: 12),
+                      Text(
+                        '${grade.acertos} acertos · Nota ${grade.nota.toStringAsFixed(1)}',
+                      ),
+                      const Text(
+                        'Compare com a foto. Toque na alternativa para corrigir a leitura.',
+                      ),
+                      const SizedBox(height: 8),
+                      for (var i = 0; i < answers.length; i++)
+                        Row(
+                          children: [
+                            Expanded(child: Text('Questão ${i + 1}')),
+                            DropdownButton<int>(
+                              value: answers[i],
+                              items: [
+                                for (final value in [-2, -1, 0, 1, 2, 3, 4])
+                                  DropdownMenuItem(
+                                    value: value,
+                                    child: Text(
+                                      value == -2
+                                          ? 'Múltiplas'
+                                          : value == -1
+                                          ? 'Em branco'
+                                          : GabaritoValidator.letraAlternativa(
+                                              value,
+                                            ),
+                                    ),
+                                  ),
+                              ],
+                              onChanged: (value) {
+                                if (value != null)
+                                  refresh(() => answers[i] = value);
+                              },
+                            ),
+                          ],
+                        ),
+                    ],
                   ),
                 ),
-            ],
-          ),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () {
-              Navigator.pop(context);
-              _resetScanner();
-            },
-            child: const Text('Escanear Outro'),
-          ),
-          ElevatedButton(
-            onPressed: () => _salvarResultados(resultados, imagePath),
-            child: const Text('Salvar'),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Future<void> _executeSave(
-    Aluno alunoParaSalvar,
-    List<int> resultados,
-    String? imagePath,
-  ) async {
-    final scaffoldMessenger = ScaffoldMessenger.of(context);
-    try {
-      await _resultadoService.salvarResultado(
-        provaId: _provaEscaneada!.id!,
-        turmaId: alunoParaSalvar.turmaId,
-        aluno: alunoParaSalvar,
-        gabaritoOficial: (_provaEscaneada!.gabarito as List<dynamic>)
-            .cast<int>(),
-        respostasAluno: resultados,
-        imagePath: imagePath, // Salva o path da imagem local
-      );
-      if (!mounted) return;
-      scaffoldMessenger.showSnackBar(
-        SnackBar(
-          content: Text('✅ Resultado salvo para ${alunoParaSalvar.nome}!'),
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.pop(dialogContext, false),
+                  child: const Text('Nova leitura'),
+                ),
+                FilledButton(
+                  onPressed: () => Navigator.pop(dialogContext, true),
+                  child: const Text('Continuar'),
+                ),
+              ],
+            );
+          },
         ),
       );
-    } catch (e) {
-      if (!mounted) return;
-      scaffoldMessenger.showSnackBar(
-        SnackBar(content: Text('❌ Erro ao salvar: $e')),
-      );
-    } finally {
-      _resetScanner();
-    }
-  }
-
-  Future<void> _salvarResultados(
-    List<int> resultados,
-    String? imagePath,
-  ) async {
-    final navigator = Navigator.of(context);
-    navigator.pop(); // Fecha o diálogo de resultados
-
-    Aluno? alunoParaSalvar = _alunoEscaneado;
-
-    if (alunoParaSalvar != null) {
-      final confirm = await showDialog<bool>(
+      if (!mounted || save != true) return;
+      final aluno = await showDialog<Aluno>(
         context: context,
-        builder: (context) => AlertDialog(
-          title: const Text('Confirmar Aluno'),
-          content: Text(
-            'Salvar este resultado para o aluno "${alunoParaSalvar.nome}"?',
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.of(context).pop(false),
-              child: const Text('CORRIGIR ALUNO'),
-            ),
-            ElevatedButton(
-              onPressed: () => Navigator.of(context).pop(true),
-              child: const Text('CONFIRMAR'),
-            ),
-          ],
-        ),
+        builder: (context) => _aluno == null
+            ? const SelecionarAlunoDialog()
+            : AlertDialog(
+                title: const Text('Confirmar aluno'),
+                content: Text('Salvar a correção para ${_aluno!.nome}?'),
+                actions: [
+                  TextButton(
+                    onPressed: () => Navigator.pop(context),
+                    child: const Text('Voltar'),
+                  ),
+                  FilledButton(
+                    onPressed: () => Navigator.pop(context, _aluno),
+                    child: const Text('Salvar'),
+                  ),
+                ],
+              ),
       );
-
-      if (confirm == true) {
-        await _executeSave(alunoParaSalvar, resultados, imagePath);
-      } else if (confirm == false) {
-        final Aluno? alunoSelecionado = await showDialog<Aluno>(
-          context: context,
-          builder: (_) => const SelecionarAlunoDialog(),
+      if (!mounted) return;
+      if (aluno == null) continue;
+      setState(() => _status = 'Salvando correção…');
+      try {
+        await _resultados.salvarResultado(
+          provaId: prova.id!,
+          turmaId: aluno.turmaId,
+          aluno: aluno,
+          gabaritoOficial: prova.gabarito,
+          respostasAluno: answers,
+          imagePath: path,
         );
-        if (alunoSelecionado != null) {
-          await _executeSave(alunoSelecionado, resultados, imagePath);
-        } else {
-          _resetScanner();
-        }
-      } else {
-        _resetScanner();
-      }
-    } else {
-      final Aluno? alunoSelecionado = await showDialog<Aluno>(
-        context: context,
-        builder: (_) => const SelecionarAlunoDialog(),
-      );
-      if (alunoSelecionado != null) {
-        await _executeSave(alunoSelecionado, resultados, imagePath);
-      } else {
-        _resetScanner();
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Correção salva para ${aluno.nome}.')),
+        );
+        return;
+      } catch (_) {
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+              'Não foi possível confirmar o salvamento. As respostas foram mantidas. Confira os resultados antes de tentar novamente.',
+            ),
+          ),
+        );
       }
     }
   }
 
-  void _resetScanner({String? errorMessage}) {
-    // REMOVIDO: _omrCameraController?.stopImageStream();
-    _omrCameraController?.dispose();
-    _omrCameraController = null;
-    _qrScannerController.start();
-    setState(() {
-      _currentStage = ScannerStage.scanningQrCode;
-      _statusMessage = errorMessage ?? "Aponte para o QR Code da prova";
-      _isProcessing = false;
-      _provaEscaneada = null;
-      _alunoEscaneado = null;
-      _expectedPage = 1;
-      _totalPages = 0;
-      _sessionAnswers.clear();
-      // REMOVIDO: _isCoolingDown, _previousCorners, _markersDetected, _stableFrames
-    });
+  Future<void> _toggleFlash() async {
+    final camera = _camera;
+    if (_busy || camera == null) return;
+    final generation = _generation;
+    try {
+      final next = !_torch;
+      await camera.setFlashMode(next ? FlashMode.torch : FlashMode.off);
+      if (_current(generation)) setState(() => _torch = next);
+    } on CameraException {
+      if (_current(generation))
+        setState(() => _status = 'Flash indisponível nesta câmera.');
+    }
   }
 
   @override
   Widget build(BuildContext context) {
+    final camera = _camera;
     return Scaffold(
+      backgroundColor: const Color(0xff101c29),
       appBar: AppBar(
-        title: const Text('Scanner API'), // Título atualizado
-        foregroundColor: Colors.white,
+        title: const Text('Corrigir prova'),
         actions: [
-          // Botão de Reset movido para a AppBar
           IconButton(
-            onPressed: () => _resetScanner(),
+            tooltip: 'Reiniciar leitura',
+            onPressed: _reviewing ? null : () => _reset(),
             icon: const Icon(Icons.refresh_rounded),
           ),
         ],
       ),
-      backgroundColor: Colors.black,
-      body: Stack(
-        fit: StackFit.expand,
-        children: [
-          if (_currentStage == ScannerStage.scanningQrCode)
-            MobileScanner(
-              controller: _qrScannerController,
-              onDetect: _onQrCodeDetected,
-            )
-          else if (_omrCameraController != null &&
-              _omrCameraController!.value.isInitialized)
-            Center(child: CameraPreview(_omrCameraController!))
-          else
-            const Center(child: CircularProgressIndicator()),
-          if (_currentStage == ScannerStage.scanningOmr)
-            _buildScannerOverlay(context), // Overlay visual
-          if (_currentStage == ScannerStage.scanningOmr)
-            Positioned(
-              top: 16,
-              right: 16,
-              child: IconButton(
-                onPressed: _toggleFlash,
-                icon: Icon(
-                  _currentFlashMode == FlashMode.torch
-                      ? Icons.flash_on
-                      : Icons.flash_off,
-                  size: 32,
-                  color: Colors.white,
-                ),
-                style: IconButton.styleFrom(
-                  backgroundColor: Colors.black.withAlpha(100),
-                ),
-              ),
-            ),
-          Align(
-            alignment: Alignment.bottomCenter,
-            child: Padding(
-              padding: const EdgeInsets.only(bottom: 40.0),
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
+      body: SafeArea(
+        child: Column(
+          children: [
+            Padding(
+              padding: const EdgeInsets.all(16),
+              child: Row(
                 children: [
-                  if (_statusMessage.isNotEmpty)
-                    Container(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 16,
-                        vertical: 8,
-                      ),
-                      decoration: BoxDecoration(
-                        color: Colors.black.withAlpha(150),
-                        borderRadius: BorderRadius.circular(8),
-                      ),
-                      child: Text(
-                        _statusMessage,
-                        textAlign: TextAlign.center,
-                        style: const TextStyle(
-                          color: Colors.white,
-                          fontWeight: FontWeight.bold,
-                          fontSize: 16,
-                        ),
+                  Icon(
+                    _stage == ScannerStage.qr
+                        ? Icons.qr_code_scanner
+                        : Icons.document_scanner_outlined,
+                    color: Colors.tealAccent,
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Text(
+                      _prova?.titulo ?? '1. Identifique a folha pelo QR Code',
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontWeight: FontWeight.w600,
                       ),
                     ),
-                  const SizedBox(height: 24),
-
-                  // --- NOVO BOTÃO DE CAPTURA ---
-                  if (_currentStage == ScannerStage.scanningOmr)
-                    _isProcessing
-                        ? const CircularProgressIndicator(color: Colors.white)
-                        : IconButton(
-                            onPressed: _onCapturePressed, // Chama a nova função
-                            icon: const Icon(Icons.camera_alt),
-                            iconSize: 64, // Botão grande
-                            color: Colors.white,
-                            style: IconButton.styleFrom(
-                              backgroundColor: Colors.black.withAlpha(100),
-                            ),
-                          ),
+                  ),
                 ],
               ),
             ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  // Overlay visual (inalterado)
-  Widget _buildScannerOverlay(BuildContext context) {
-    // Agora _markersDetected não existe. O overlay será sempre branco.
-    // Poderíamos reativar _markersDetected se fizermos uma chamada leve à API
-    // mas por agora vamos simplificar.
-    final cornerColor = Colors.white.withAlpha(200);
-    const double cornerLength = 30.0;
-    const double cornerThickness = 4.0;
-    final overlayWidth = MediaQuery.of(context).size.width * 0.9;
-    final overlayHeight = overlayWidth * sqrt(2); // A4 ratio
-
-    return Center(
-      child: SizedBox(
-        width: overlayWidth,
-        height: overlayHeight,
-        child: Stack(
-          children: [
-            Positioned(
-              top: 0,
-              left: 0,
-              child: _buildCorner(
-                cornerColor,
-                cornerLength,
-                cornerThickness,
-                isTopLeft: true,
+            Expanded(
+              child: LayoutBuilder(
+                builder: (context, constraints) => Stack(
+                  fit: StackFit.expand,
+                  children: [
+                    // Keep the QR widget mounted; start/stop is controlled explicitly.
+                    Offstage(
+                      offstage: _stage != ScannerStage.qr,
+                      child: MobileScanner(controller: _qr, onDetect: _onQr),
+                    ),
+                    if (_stage == ScannerStage.sheet &&
+                        camera != null &&
+                        camera.value.isInitialized)
+                      Center(
+                        child: AspectRatio(
+                          aspectRatio: 1 / camera.value.aspectRatio,
+                          child: CameraPreview(camera),
+                        ),
+                      ),
+                    if (_stage == ScannerStage.sheet)
+                      IgnorePointer(
+                        child: Center(
+                          child: Container(
+                            width: min(
+                              constraints.maxWidth * .9,
+                              constraints.maxHeight * .9 / sqrt(2),
+                            ),
+                            height: min(
+                              constraints.maxHeight * .9,
+                              constraints.maxWidth * .9 * sqrt(2),
+                            ),
+                            decoration: BoxDecoration(
+                              border: Border.all(
+                                color: Colors.white70,
+                                width: 2,
+                              ),
+                              borderRadius: BorderRadius.circular(12),
+                            ),
+                          ),
+                        ),
+                      ),
+                    if (_stage == ScannerStage.sheet)
+                      Positioned(
+                        top: 8,
+                        right: 8,
+                        child: IconButton(
+                          tooltip: 'Alternar flash',
+                          onPressed: _busy ? null : _toggleFlash,
+                          icon: Icon(
+                            _torch ? Icons.flash_on : Icons.flash_off,
+                            color: Colors.white,
+                          ),
+                        ),
+                      ),
+                    if (_busy)
+                      const Center(
+                        child: CircularProgressIndicator(
+                          color: Colors.tealAccent,
+                        ),
+                      ),
+                  ],
+                ),
               ),
             ),
-            Positioned(
-              top: 0,
-              right: 0,
-              child: _buildCorner(
-                cornerColor,
-                cornerLength,
-                cornerThickness,
-                isTopRight: true,
-              ),
-            ),
-            Positioned(
-              bottom: 0,
-              left: 0,
-              child: _buildCorner(
-                cornerColor,
-                cornerLength,
-                cornerThickness,
-                isBottomLeft: true,
-              ),
-            ),
-            Positioned(
-              bottom: 0,
-              right: 0,
-              child: _buildCorner(
-                cornerColor,
-                cornerLength,
-                cornerThickness,
-                isBottomRight: true,
+            Padding(
+              padding: const EdgeInsets.all(20),
+              child: Column(
+                children: [
+                  Semantics(
+                    liveRegion: true,
+                    child: Text(
+                      _status,
+                      textAlign: TextAlign.center,
+                      style: const TextStyle(color: Colors.white),
+                    ),
+                  ),
+                  const SizedBox(height: 16),
+                  if (_stage == ScannerStage.sheet)
+                    FilledButton.icon(
+                      onPressed: _busy ? null : _capture,
+                      icon: const Icon(Icons.camera_alt_outlined),
+                      label: const Text('Fotografar folha'),
+                    ),
+                  if (_stage == ScannerStage.starting && !_busy)
+                    FilledButton(
+                      onPressed: () => _reset(),
+                      child: const Text('Tentar novamente'),
+                    ),
+                ],
               ),
             ),
           ],
@@ -652,81 +554,4 @@ class CameraScannerPageState extends State<CameraScannerPage> {
       ),
     );
   }
-
-  Widget _buildCorner(
-    Color color,
-    double length,
-    double thickness, {
-    bool isTopLeft = false,
-    bool isTopRight = false,
-    bool isBottomLeft = false,
-    bool isBottomRight = false,
-  }) {
-    return SizedBox(
-      width: length,
-      height: length,
-      child: CustomPaint(
-        painter: _CornerPainter(
-          color,
-          thickness,
-          isTopLeft: isTopLeft,
-          isTopRight: isTopRight,
-          isBottomLeft: isBottomLeft,
-          isBottomRight: isBottomRight,
-        ),
-      ),
-    );
-  }
-} // Fim de CameraScannerPageState
-
-// --- Funções Helper Removidas ---
-// REMOVIDO: _saveImageTemporarily, _convertBGRA8888, _convertFromPlanes
-
-// Custom painter (inalterado)
-class _CornerPainter extends CustomPainter {
-  final Color color;
-  final double thickness;
-  final bool isTopLeft;
-  final bool isTopRight;
-  final bool isBottomLeft;
-  final bool isBottomRight;
-
-  _CornerPainter(
-    this.color,
-    this.thickness, {
-    this.isTopLeft = false,
-    this.isTopRight = false,
-    this.isBottomLeft = false,
-    this.isBottomRight = false,
-  });
-
-  @override
-  void paint(Canvas canvas, Size size) {
-    final paint = Paint()
-      ..color = color
-      ..strokeWidth = thickness
-      ..style = PaintingStyle.stroke;
-    final path = Path();
-    if (isTopLeft) {
-      path.moveTo(0, size.height);
-      path.lineTo(0, 0);
-      path.lineTo(size.width, 0);
-    } else if (isTopRight) {
-      path.moveTo(0, 0);
-      path.lineTo(size.width, 0);
-      path.lineTo(size.width, size.height);
-    } else if (isBottomLeft) {
-      path.moveTo(0, 0);
-      path.lineTo(0, size.height);
-      path.lineTo(size.width, size.height);
-    } else if (isBottomRight) {
-      path.moveTo(size.width, 0);
-      path.lineTo(size.width, size.height);
-      path.lineTo(0, size.height);
-    }
-    canvas.drawPath(path, paint);
-  }
-
-  @override
-  bool shouldRepaint(covariant _CornerPainter oldDelegate) => false;
 }
