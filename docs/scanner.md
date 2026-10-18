@@ -37,7 +37,8 @@ A leitura das marcações e do QR não exige servidor. Autenticação, carregame
 - A imagem `tests/fixtures/printed_sheet.png` foi renderizada do PDF emitido pelo gerador real. O teste lê a folha vazia e a mesma imagem com 50 marcações conhecidas.
 - O PDF de 50 questões foi inspecionado visualmente: sem sobreposição ou recorte dos círculos, QR, textos e marcadores.
 - A compilação da parte Flutter do projeto completo passou (`flutter build bundle --debug --no-pub`).
-- A compilação Android ficou bloqueada por uma falha do ambiente Java/Gradle: `java.io.IOException: Unable to establish loopback connection`, causada por `SocketException: Invalid argument: connect` em `UnixDomainSockets.connect0`. Não foi produzido um APK validado nesta execução.
+- A compilação Android passou com `flutter build apk --debug --no-pub`, gerando `build/app/outputs/flutter-apk/app-debug.apk`. O APK ainda não foi testado em aparelho físico.
+- Para compilar neste ambiente Windows, foi necessário apontar `jdk.net.unixdomain.tmpdir` para `.gradle/java-sockets` dentro do projeto. O helper `tool/build_android.ps1` aplica essa opção somente durante a compilação, sem alterações permanentes no Java ou no sistema.
 
 ## Validação física pendente
 

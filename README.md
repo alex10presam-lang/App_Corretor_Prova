@@ -30,7 +30,7 @@ O reconhecimento usa Dart e a biblioteca `image`. Não envia fotografias a uma A
 
 34 testes passaram com Flutter 3.35.4 / Dart 3.9.2 e as versões do projeto original. A suíte cobre contrato do QR, 1 a 50 questões, duas colunas, rotação, perspectiva moderada, sombra suave, respostas em branco, múltiplas marcações, marcas parciais, desfoque, arquivos inválidos, cancelamento e leitura de uma imagem renderizada do PDF real.
 
-Os testes usam imagens sintéticas e o PDF real renderizado; **não constituem uma medição de acurácia em fotos de celulares**. Ainda é necessário testar impressões, câmeras e condições reais. A compilação Flutter (`flutter build bundle --debug --no-pub`) passou no projeto completo. A tentativa de gerar o APK neste ambiente foi bloqueada por `Unable to establish loopback connection` no Java/Gradle antes da compilação Android.
+Os testes usam imagens sintéticas e o PDF real renderizado; **não constituem uma medição de acurácia em fotos de celulares**. Ainda é necessário testar impressões, câmeras e condições reais. A compilação Flutter (`flutter build bundle --debug --no-pub`) passou no projeto completo. A compilação Android também passou e gerou um APK de teste (`app-debug.apk`). Esse resultado confirma a compilação, não a precisão da leitura em aparelhos físicos.
 
 ## Estrutura
 
@@ -63,5 +63,13 @@ Para aplicar as alterações à pasta do projeto Flutter original:
 ```
 
 O instalador preserva uma cópia dos arquivos substituídos em `.scanner-backups/`, copia o scanner e seus testes, corrige dois imports quebrados e adiciona as declarações de câmera necessárias. Não altera a configuração do Firebase. A dependência `image` já existe no projeto original; a versão validada é 4.5.4.
+
+Para gerar um APK de teste no Windows:
+
+```powershell
+./tool/build_android.ps1 -ProjectPath 'C:\caminho\corretor_provas'
+```
+
+O script usa uma pasta de sockets dentro do projeto para evitar uma falha de comunicação do Java em ambientes Windows com virtualização de arquivos. A opção vale somente para a compilação, sem mudar configurações permanentes do sistema.
 
 Consulte [a documentação do scanner](docs/scanner.md) para os limites, o contrato da folha e o roteiro de teste em aparelho físico.
