@@ -1,8 +1,27 @@
 # Corretor de Provas
 
+**Da folha impressa à revisão das respostas, no celular.**
+
+Aplicativo desenvolvido em Flutter para organizar turmas, alunos e provas objetivas, gerar folhas de respostas em PDF e acompanhar resultados. Projeto pessoal independente, com foco na integração entre a rotina de avaliação e o processamento de imagens no dispositivo.
+
 Correção de provas objetivas com leitura da folha **no próprio celular**. O scanner identifica as marcações, destaca respostas que precisam de conferência e permite revisar a nota antes de salvar.
 
 O reconhecimento usa Dart e a biblioteca `image`. Não envia fotografias a uma API de leitura e não depende de um servidor Python. Login, consulta de provas/alunos e persistência continuam usando Firebase.
+
+## Recursos
+
+| Etapa | O que o aplicativo oferece |
+| --- | --- |
+| Organização | Cadastro de turmas, alunos, provas e gabaritos |
+| Impressão | Folhas A4 com QR Code, de 1 a 50 questões e alternativas A–E |
+| Captura | Identificação da folha e fotografia pela câmera do celular |
+| Reconhecimento | Leitura óptica de marcações (OMR), com ajuste de perspectiva e orientação |
+| Revisão | Conferência da foto, edição das respostas e destaque de marcações duvidosas |
+| Resultados | Cálculo da nota e registro associado ao aluno |
+
+**Tecnologias:** Flutter · Dart · Firebase · `image` · `camera` · `mobile_scanner` · `pdf`.
+
+Para explorar o código, comece pela [arquitetura do scanner](docs/scanner.md) ou pelos [testes de reconhecimento](tests/scanner_test.dart).
 
 ## Como usar
 
@@ -15,6 +34,8 @@ O reconhecimento usa Dart e a biblioteca `image`. Não envia fotografias a uma A
 **Folhas antigas precisam ser geradas novamente.** O modelo `local-v1` tem posições fixas para até 50 questões e cinco alternativas. QRs antigos, de outras versões ou de provas cuja quantidade de questões mudou são recusados. Folhas avulsas sem prova cadastrada podem ser impressas, mas não têm correção automática.
 
 <img src="tests/fixtures/printed_sheet.png" alt="Modelo de folha local com 50 questões" width="360">
+
+*Folha demonstrativa renderizada a partir do PDF gerado pelo aplicativo.*
 
 ## Leitura local
 
@@ -35,6 +56,8 @@ Os testes usam imagens sintéticas e o PDF real renderizado; **não constituem u
 ## Estrutura
 
 Este repositório preserva a organização original de fontes equivalentes a `lib/`. O projeto Flutter completo foi localizado e usado na validação, mas suas pastas de plataforma e configurações locais não foram importadas para este repositório.
+
+Por isso, este checkout não executa `flutter run` diretamente. É possível testar o scanner com o ambiente isolado abaixo; para executar o aplicativo completo, é necessário o projeto Flutter original com suas plataformas e configuração Firebase.
 
 | Arquivo | Responsabilidade |
 | --- | --- |
