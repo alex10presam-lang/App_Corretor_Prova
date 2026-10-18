@@ -1,65 +1,67 @@
 # Corretor de Provas
 
-Aplicativo Flutter para organizar turmas, gerar folhas de resposta e revisar correções de provas objetivas. Usa Firebase para autenticação e armazenamento, e um serviço HTTP externo para ler as marcações da folha (OMR).
+Correção de provas objetivas com leitura da folha **no próprio celular**. O scanner identifica as marcações, destaca respostas que precisam de conferência e permite revisar a nota antes de salvar.
 
-## Estado do repositório
+O reconhecimento usa Dart e a biblioteca `image`. Não envia fotografias a uma API de leitura e não depende de um servidor Python. Login, consulta de provas/alunos e persistência continuam usando Firebase.
 
-Este repositório contém os arquivos que compõem a pasta `lib/` do aplicativo. O projeto Flutter completo (`pubspec.yaml`, `android/`, `ios/`) e o servidor Python de leitura **não estão incluídos**. Por isso, esta cópia não gera um aplicativo instalável por conta própria.
+## Como usar
 
-A atualização do scanner corrige o fluxo no cliente. A precisão do reconhecimento e a execução em aparelho físico ainda precisam de validação com o serviço real.
+1. Gere uma folha nova pelo aplicativo e imprima sem cortar as margens.
+2. Leia o QR Code da folha.
+3. Fotografe a página inteira, com os quatro quadrados dos cantos visíveis.
+4. Confira a foto e as alternativas reconhecidas. Branco, múltiplas marcações e marcas fracas ficam sinalizados.
+5. Confirme a revisão, selecione/confirme o aluno e salve.
 
-## Fluxo de correção
+**Folhas antigas precisam ser geradas novamente.** O modelo `local-v1` tem posições fixas para até 50 questões e cinco alternativas. QRs antigos, de outras versões ou de provas cuja quantidade de questões mudou são recusados. Folhas avulsas sem prova cadastrada podem ser impressas, mas não têm correção automática.
 
-1. Leia o QR Code da folha gerada pelo aplicativo.
-2. Enquadre a folha inteira, mantendo os quatro marcadores visíveis.
-3. Fotografe e aguarde a análise.
-4. Compare as alternativas reconhecidas com a foto e ajuste eventuais erros de leitura.
-5. Confirme o aluno e salve a correção.
+<img src="tests/fixtures/printed_sheet.png" alt="Modelo de folha local com 50 questões" width="360">
 
-Nenhuma nota é salva automaticamente após a captura. Respostas incompletas ou fora do formato esperado são rejeitadas antes do cálculo.
+## Leitura local
 
-## O que mudou no scanner
+- O gerador de PDF e o leitor compartilham a mesma definição de posições.
+- Quatro marcadores permitem corrigir a perspectiva; um padrão adicional identifica a orientação da folha.
+- O QR da fotografia é comparado ao QR identificado no início, para evitar troca de prova ou aluno.
+- O preenchimento é medido no interior dos círculos, com compensação local de iluminação.
+- Imagens com marcadores ausentes, baixa resolução, desfoque intenso ou alinhamento inconsistente são recusadas.
+- O processamento roda em um isolate, fora da interface, e pode ser interrompido ao reiniciar ou sair da tela.
+- Nenhum resultado é salvo sem conferência. A foto é temporária e não é enviada ao Firebase por este fluxo.
 
-- Liberação explícita da câmera entre a leitura do QR e a fotografia; preferência pela câmera traseira.
-- Cancelamento da comunicação ao reiniciar ou sair da tela; respostas antigas não atualizam uma nova leitura.
-- Limite de 45 segundos para envio e recebimento da análise, com mensagens para erros de rede e HTTP.
-- Envio do número integral de questões da folha. A versão anterior limitava a requisição a 25, mesmo quando o PDF continha mais questões.
-- Conferência e ajuste das alternativas antes de salvar, com foto e nota calculada.
-- Preservação das respostas no diálogo quando o salvamento falha e remoção da foto temporária ao encerrar o fluxo.
+## Estado e validação
 
-O gerador atual declara uma página por aluno. QRs com várias páginas são recusados explicitamente: faltam identificação individual e um contrato de paginação com o servidor para impedir duplicação ou troca de folhas. Isso substitui a montagem anterior, que podia completar leituras ausentes com respostas em branco.
+34 testes passaram com Flutter 3.35.4 / Dart 3.9.2 e as versões do projeto original. A suíte cobre contrato do QR, 1 a 50 questões, duas colunas, rotação, perspectiva moderada, sombra suave, respostas em branco, múltiplas marcações, marcas parciais, desfoque, arquivos inválidos, cancelamento e leitura de uma imagem renderizada do PDF real.
 
-## Organização
+Os testes usam imagens sintéticas e o PDF real renderizado; **não constituem uma medição de acurácia em fotos de celulares**. Ainda é necessário testar impressões, câmeras e condições reais. A compilação Flutter (`flutter build bundle --debug --no-pub`) passou no projeto completo. A tentativa de gerar o APK neste ambiente foi bloqueada por `Unable to establish loopback connection` no Java/Gradle antes da compilação Android.
 
-| Local | Responsabilidade |
+## Estrutura
+
+Este repositório preserva a organização original de fontes equivalentes a `lib/`. O projeto Flutter completo foi localizado e usado na validação, mas suas pastas de plataforma e configurações locais não foram importadas para este repositório.
+
+| Arquivo | Responsabilidade |
 | --- | --- |
-| `pages/camera_scanner_page.dart` | Câmera, estados da tela e revisão da correção |
-| `scanner/scan_contract.dart` | Validação do QR e das respostas reconhecidas |
-| `services/omr_service.dart` | Upload, prazo de resposta e erros do serviço |
-| `services/pdf_service.dart` | Geração das folhas |
-| `services/resultado_service.dart` | Persistência no Firebase |
-| `tests/scanner_test.dart` | Contrato e cenários de falha de comunicação |
+| `scanner/sheet_layout.dart` | Coordenadas e versão do modelo impresso |
+| `scanner/scan_contract.dart` | Identidade da prova, aluno, versão e número de questões |
+| `scanner/local_omr.dart` | Marcadores, perspectiva e medição das alternativas |
+| `services/local_omr_service.dart` | Execução isolada, cancelamento e limite de tempo |
+| `services/pdf_service.dart` | Geração da folha compatível |
+| `pages/camera_scanner_page.dart` | Câmeras, revisão e confirmação do resultado |
+| `tests/` | Testes de contrato, imagem, worker e PDF |
 
-## Verificação isolada
+## Testes e integração
 
-Com Flutter instalado, execute no PowerShell:
+Para verificar o scanner isoladamente no Windows, com Flutter instalado:
 
 ```powershell
 ./tool/verify_scanner.ps1
 ```
 
-Use `-Offline` se as dependências já estiverem no cache. O script copia apenas o scanner e suas dependências locais para `.scanner_check/`, resolve versões declaradas em `tool/scanner_pubspec.yaml`, executa análise estática e testes. Não consulta o Firebase nem envia fotos ao servidor real.
+Use `-Offline` quando as dependências estiverem no cache. O script monta `.scanner_check/` com as versões usadas na validação; não consulta o Firebase nem chama um serviço externo.
 
-Esse ambiente é um teste isolado, não uma reconstrução do projeto original. As versões escolhidas para a verificação precisam ser conciliadas com o `pubspec.yaml` original antes da integração.
+Para aplicar as alterações à pasta do projeto Flutter original:
 
-## Integração e pendências
-
-Copie os arquivos alterados para os mesmos caminhos dentro de `lib/` do projeto completo. Preserve a configuração existente de Firebase e das plataformas. O scanner requer as dependências `camera`, `mobile_scanner`, `http` e `http_parser`, além das dependências já usadas pelos serviços do app.
-
-O endereço pode ser configurado na compilação:
-
-```sh
-flutter run --dart-define=OMR_API_URL=https://seu-servico.example/processar
+```powershell
+./tool/install_local_scanner.ps1 -ProjectPath 'C:\caminho\corretor_provas'
 ```
 
-Sem essa opção, permanece o endereço anteriormente configurado no código. Veja [o contrato HTTP e o roteiro de validação](docs/scanner.md) antes de integrar a alteração.
+O instalador preserva uma cópia dos arquivos substituídos em `.scanner-backups/`, copia o scanner e seus testes, corrige dois imports quebrados e adiciona as declarações de câmera necessárias. Não altera a configuração do Firebase. A dependência `image` já existe no projeto original; a versão validada é 4.5.4.
+
+Consulte [a documentação do scanner](docs/scanner.md) para os limites, o contrato da folha e o roteiro de teste em aparelho físico.

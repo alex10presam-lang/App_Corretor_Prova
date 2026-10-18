@@ -5,7 +5,7 @@ import '../models/prova.dart';
 import '../models/resultado.dart';
 import '../services/prova_service.dart';
 import '../services/resultado_service.dart';
-import '../scanner/validator.dart';
+import '../utils/validator.dart';
 
 class EditarResultadoPage extends StatefulWidget {
   final String resultadoId;

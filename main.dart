@@ -10,7 +10,7 @@ import 'package:provider/provider.dart';
 import 'firebase_options.dart';
 
 // Imports de páginas
-import '/login_page.dart'; // Corrigido para apontar para a pasta pages
+import 'login_page.dart'; // Corrigido para apontar para a pasta pages
 import 'home_screen.dart';
 
 // Import do tema

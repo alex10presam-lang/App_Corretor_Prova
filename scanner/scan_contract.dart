@@ -1,18 +1,22 @@
 import 'dart:convert';
+import 'sheet_layout.dart';
 
-/// The QR identifies the sheet; it does not contain an answer key.
 class ScanSheet {
   final String provaId;
   final String? alunoId;
   final String? turmaId;
-  final int totalPages;
-
-  const ScanSheet(this.provaId, this.alunoId, this.turmaId, this.totalPages);
+  final int questionCount;
+  const ScanSheet(this.provaId, this.alunoId, this.turmaId, this.questionCount);
 
   factory ScanSheet.parse(String raw) {
     final dynamic value = jsonDecode(raw);
     if (value is! Map<String, dynamic>) {
       throw const FormatException('Este QR Code não identifica uma prova.');
+    }
+    if (value['layout'] != SheetLayout.version || value['totalPages'] != 1) {
+      throw const FormatException(
+        'Folha incompatível. Gere e imprima o novo modelo de leitura local.',
+      );
     }
     String? identifier(String key) {
       final dynamic id = value[key];
@@ -26,49 +30,27 @@ class ScanSheet {
     final prova = identifier('provaId');
     final aluno = identifier('alunoId');
     final turma = identifier('turmaId');
-    final dynamic pages = value['totalPages'];
-    if (prova == null || pages is! int || pages < 1) {
-      throw const FormatException(
-        'QR Code sem identificação ou paginação válida.',
-      );
+    final dynamic count = value['questions'];
+    if (prova == null || count is! int || (aluno == null) != (turma == null)) {
+      throw const FormatException('Identificação da folha incompleta.');
     }
-    if ((aluno == null) != (turma == null)) {
-      throw const FormatException('Identificação de aluno e turma incompleta.');
-    }
-    return ScanSheet(prova, aluno, turma, pages);
+    SheetLayout.validateCount(count);
+    return ScanSheet(prova, aluno, turma, count);
   }
 
-  int questionsOnSheet(int questionCount) {
-    if (questionCount < 1) {
-      throw const FormatException('A prova não possui questões.');
-    }
-    // The PDF generator in this repository emits exactly one sheet per student.
-    // Multi-page sheets need a page identifier before they can be graded safely.
-    if (totalPages != 1) {
+  int questionsOnSheet(int count) {
+    SheetLayout.validateCount(count);
+    if (count != questionCount) {
       throw const FormatException(
-        'Use uma folha de página única gerada por este aplicativo. '
-        'A leitura de várias páginas ainda não está disponível.',
+        'A prova mudou. Gere uma nova folha antes de corrigir.',
       );
     }
-    return questionCount;
+    return count;
   }
-}
 
-List<int> decodeOmrAnswers(String body, int expectedQuestions) {
-  final dynamic data = jsonDecode(body);
-  if (expectedQuestions < 1 || data is! Map<String, dynamic>) {
-    throw const FormatException('Resposta inválida do serviço de leitura.');
-  }
-  final dynamic answers = data['answers'];
-  if (answers is! List || answers.length != expectedQuestions) {
-    throw FormatException(
-      'A leitura precisa retornar exatamente $expectedQuestions respostas. '
-      'Enquadre a folha inteira e tente novamente.',
-    );
-  }
-  // -1 = blank; -2 = multiple marks; 0..4 = A..E, as used by the validator.
-  if (answers.any((dynamic item) => item is! int || item < -2 || item > 4)) {
-    throw const FormatException('O serviço retornou alternativas inválidas.');
-  }
-  return List<int>.from(answers);
+  bool sameSheet(ScanSheet other) =>
+      provaId == other.provaId &&
+      alunoId == other.alunoId &&
+      turmaId == other.turmaId &&
+      questionCount == other.questionCount;
 }

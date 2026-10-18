@@ -11,7 +11,8 @@ import '../models/aluno.dart';
 import '../models/prova.dart';
 import '../scanner/scan_contract.dart';
 import '../services/aluno_service.dart';
-import '../services/omr_service.dart';
+import '../services/local_omr_service.dart';
+import '../scanner/local_omr.dart';
 import '../services/prova_service.dart';
 import '../services/resultado_service.dart';
 import '../utils/validator.dart';
@@ -27,7 +28,7 @@ class CameraScannerPage extends StatefulWidget {
 class CameraScannerPageState extends State<CameraScannerPage>
     with WidgetsBindingObserver {
   final _qr = MobileScannerController(autoStart: false);
-  final _omr = OmrService();
+  final _omr = LocalOmrService();
   final _provas = ProvaService();
   final _alunos = AlunoService();
   final _resultados = ResultadoService();
@@ -42,6 +43,7 @@ class CameraScannerPageState extends State<CameraScannerPage>
   int _generation = 0;
   Prova? _prova;
   Aluno? _aluno;
+  ScanSheet? _sheet;
 
   bool _current(int generation) =>
       mounted && _foreground && generation == _generation;
@@ -100,10 +102,14 @@ class CameraScannerPageState extends State<CameraScannerPage>
   }
 
   String _error(Object error) {
-    if (error is OmrException) return error.message;
     if (error is FormatException) return error.message;
-    if (error is TimeoutException)
+    if (error is MobileScannerException &&
+        error.errorCode == MobileScannerErrorCode.permissionDenied) {
+      return 'Permita o acesso à câmera nas configurações do celular.';
+    }
+    if (error is TimeoutException) {
       return 'A consulta demorou demais. Tente novamente.';
+    }
     if (error is CameraException && error.code.contains('Access')) {
       return 'Permita o acesso à câmera nas configurações do celular.';
     }
@@ -119,6 +125,7 @@ class CameraScannerPageState extends State<CameraScannerPage>
       _busy = true;
       _prova = null;
       _aluno = null;
+      _sheet = null;
       _torch = false;
       _status = message ?? 'Aponte para o QR Code da folha';
     });
@@ -142,7 +149,9 @@ class CameraScannerPageState extends State<CameraScannerPage>
   }
 
   Future<void> _onQr(BarcodeCapture capture) async {
-    if (_busy || _stage != ScannerStage.qr || !_foreground) return;
+    if (!mounted || _busy || _stage != ScannerStage.qr || !_foreground) {
+      return;
+    }
     final codes = capture.barcodes.where((code) => code.rawValue != null);
     if (codes.isEmpty) return;
     final generation = ++_generation;
@@ -173,23 +182,26 @@ class CameraScannerPageState extends State<CameraScannerPage>
             .getAlunoById(sheet.turmaId!, sheet.alunoId!)
             .timeout(const Duration(seconds: 20));
         if (!_current(generation)) return;
-        if (aluno == null)
+        if (aluno == null) {
           throw const FormatException('Aluno da folha não encontrado.');
+        }
       }
+      _sheet = sheet;
       _prova = prova;
       _aluno = aluno;
       await _serializeCamera(() async {
         if (!_current(generation)) return;
         final cameras = await availableCameras();
         if (!_current(generation)) return;
-        if (cameras.isEmpty)
+        if (cameras.isEmpty) {
           throw const FormatException('Nenhuma câmera disponível.');
+        }
         final back = cameras.where(
           (c) => c.lensDirection == CameraLensDirection.back,
         );
         final controller = CameraController(
           back.isEmpty ? cameras.first : back.first,
-          ResolutionPreset.high,
+          ResolutionPreset.veryHigh,
           enableAudio: false,
         );
         try {
@@ -225,8 +237,14 @@ class CameraScannerPageState extends State<CameraScannerPage>
   Future<void> _capture() async {
     final camera = _camera;
     final prova = _prova;
-    if (_busy || camera == null || prova == null || !camera.value.isInitialized)
+    if (!mounted ||
+        !_foreground ||
+        _busy ||
+        camera == null ||
+        prova == null ||
+        !camera.value.isInitialized) {
       return;
+    }
     final generation = _generation;
     setState(() {
       _busy = true;
@@ -237,15 +255,38 @@ class CameraScannerPageState extends State<CameraScannerPage>
     try {
       photo = await camera.takePicture();
       if (!_current(generation)) return;
-      setState(() => _status = 'Lendo as ${prova.numeroQuestoes} questões…');
-      final answers = await _omr.scan(photo.path, prova.numeroQuestoes);
+      setState(() => _status = 'Conferindo o QR da fotografia…');
+      final photographed = await _qr
+          .analyzeImage(photo.path)
+          .timeout(const Duration(seconds: 15));
+      if (!_current(generation)) return;
+      final matches = <ScanSheet>[];
+      for (final barcode in photographed?.barcodes ?? <Barcode>[]) {
+        if (barcode.rawValue == null) continue;
+        try {
+          matches.add(ScanSheet.parse(barcode.rawValue!));
+        } on FormatException {
+          /* unrelated QR */
+        }
+      }
+      if (matches.length != 1 ||
+          _sheet == null ||
+          !_sheet!.sameSheet(matches.single)) {
+        throw const FormatException(
+          'A foto precisa mostrar o QR da mesma folha identificada. Aproxime sem cortar os cantos.',
+        );
+      }
+      setState(
+        () => _status = 'Lendo ${prova.numeroQuestoes} questões no celular…',
+      );
+      final result = await _omr.scan(photo.path, prova.numeroQuestoes);
       if (!_current(generation)) return;
       _reviewing = true;
       enteredReview = true;
       setState(() => _stage = ScannerStage.review);
       await _serializeCamera(_releaseCameras);
       if (!mounted || !_foreground) return;
-      await _reviewAndSave(prova, answers, photo.path);
+      await _reviewAndSave(prova, result, photo.path);
     } catch (error) {
       if (_current(generation)) {
         setState(() {
@@ -254,7 +295,7 @@ class CameraScannerPageState extends State<CameraScannerPage>
         });
       }
     } finally {
-      // The upload completes before cleanup; temporary photos do not accumulate.
+      // Recognition and review finish before the temporary photo is removed.
       if (photo != null) {
         try {
           await File(photo.path).delete();
@@ -271,10 +312,11 @@ class CameraScannerPageState extends State<CameraScannerPage>
 
   Future<void> _reviewAndSave(
     Prova prova,
-    List<int> detected,
+    LocalScanResult result,
     String path,
   ) async {
-    final answers = List<int>.from(detected);
+    final answers = List<int>.from(result.answers);
+    var confirmedReview = false;
     while (mounted) {
       final save = await showDialog<bool>(
         context: context,
@@ -298,19 +340,44 @@ class CameraScannerPageState extends State<CameraScannerPage>
                       Text(prova.titulo),
                       if (_aluno != null) Text('Aluno: ${_aluno!.nome}'),
                       const SizedBox(height: 12),
-                      Image.file(File(path), height: 150, fit: BoxFit.contain),
+                      GestureDetector(
+                        onTap: () => showDialog<void>(
+                          context: context,
+                          builder: (context) => Dialog(
+                            child: InteractiveViewer(
+                              minScale: .5,
+                              maxScale: 6,
+                              child: Image.file(File(path)),
+                            ),
+                          ),
+                        ),
+                        child: Image.file(
+                          File(path),
+                          height: 150,
+                          fit: BoxFit.contain,
+                        ),
+                      ),
                       const SizedBox(height: 12),
                       Text(
                         '${grade.acertos} acertos · Nota ${grade.nota.toStringAsFixed(1)}',
                       ),
                       const Text(
-                        'Compare com a foto. Toque na alternativa para corrigir a leitura.',
+                        'Toque na foto para ampliar. Confira as alternativas antes de salvar.',
                       ),
                       const SizedBox(height: 8),
                       for (var i = 0; i < answers.length; i++)
                         Row(
                           children: [
-                            Expanded(child: Text('Questão ${i + 1}')),
+                            Expanded(
+                              child: Text(
+                                'Questão ${i + 1}${result.uncertain.contains(i) ? ' • conferir' : ''}',
+                                style: TextStyle(
+                                  color: result.uncertain.contains(i)
+                                      ? Colors.deepOrange
+                                      : null,
+                                ),
+                              ),
+                            ),
                             DropdownButton<int>(
                               value: answers[i],
                               items: [
@@ -329,12 +396,25 @@ class CameraScannerPageState extends State<CameraScannerPage>
                                   ),
                               ],
                               onChanged: (value) {
-                                if (value != null)
-                                  refresh(() => answers[i] = value);
+                                if (value != null) {
+                                  refresh(() {
+                                    answers[i] = value;
+                                    confirmedReview = false;
+                                  });
+                                }
                               },
                             ),
                           ],
                         ),
+                      CheckboxListTile(
+                        contentPadding: EdgeInsets.zero,
+                        title: const Text(
+                          'Conferi as alternativas com a folha',
+                        ),
+                        value: confirmedReview,
+                        onChanged: (value) =>
+                            refresh(() => confirmedReview = value ?? false),
+                      ),
                     ],
                   ),
                 ),
@@ -345,7 +425,9 @@ class CameraScannerPageState extends State<CameraScannerPage>
                   child: const Text('Nova leitura'),
                 ),
                 FilledButton(
-                  onPressed: () => Navigator.pop(dialogContext, true),
+                  onPressed: confirmedReview
+                      ? () => Navigator.pop(dialogContext, true)
+                      : null,
                   child: const Text('Continuar'),
                 ),
               ],
@@ -383,7 +465,7 @@ class CameraScannerPageState extends State<CameraScannerPage>
           aluno: aluno,
           gabaritoOficial: prova.gabarito,
           respostasAluno: answers,
-          imagePath: path,
+          imagePath: null, // Recognition photos stay on the device.
         );
         if (!mounted) return;
         ScaffoldMessenger.of(context).showSnackBar(
@@ -405,15 +487,16 @@ class CameraScannerPageState extends State<CameraScannerPage>
 
   Future<void> _toggleFlash() async {
     final camera = _camera;
-    if (_busy || camera == null) return;
+    if (!mounted || !_foreground || _busy || camera == null) return;
     final generation = _generation;
     try {
       final next = !_torch;
       await camera.setFlashMode(next ? FlashMode.torch : FlashMode.off);
       if (_current(generation)) setState(() => _torch = next);
     } on CameraException {
-      if (_current(generation))
+      if (_current(generation)) {
         setState(() => _status = 'Flash indisponível nesta câmera.');
+      }
     }
   }
 
@@ -471,12 +554,7 @@ class CameraScannerPageState extends State<CameraScannerPage>
                     if (_stage == ScannerStage.sheet &&
                         camera != null &&
                         camera.value.isInitialized)
-                      Center(
-                        child: AspectRatio(
-                          aspectRatio: 1 / camera.value.aspectRatio,
-                          child: CameraPreview(camera),
-                        ),
-                      ),
+                        Center(child: CameraPreview(camera)),
                     if (_stage == ScannerStage.sheet)
                       IgnorePointer(
                         child: Center(
