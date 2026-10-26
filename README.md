@@ -1,12 +1,56 @@
+<div align="center">
+
 # Corretor de Provas
 
-**Da folha impressa à revisão das respostas, no celular.**
+**Da folha impressa à nota revisada, no próprio celular.**
 
-Aplicativo desenvolvido em Flutter para organizar turmas, alunos e provas objetivas, gerar folhas de respostas em PDF e acompanhar resultados. Projeto pessoal independente, com foco na integração entre a rotina de avaliação e o processamento de imagens no dispositivo.
+Aplicativo Flutter para organizar turmas, alunos e provas objetivas, gerar folhas de respostas em PDF
+e corrigir por leitura óptica (OMR) no aparelho, sem enviar fotos a servidores.
 
-Correção de provas objetivas com leitura da folha **no próprio celular**. O scanner identifica as marcações, destaca respostas que precisam de conferência e permite revisar a nota antes de salvar.
+![Flutter](https://img.shields.io/badge/Flutter-3.35-6B46C1?logo=flutter&logoColor=white)
+![Dart](https://img.shields.io/badge/Dart-3.9-6B46C1?logo=dart&logoColor=white)
+![Firebase](https://img.shields.io/badge/Firebase-Auth%20%C2%B7%20Firestore-6B46C1?logo=firebase&logoColor=white)
+![Testes do scanner](https://img.shields.io/badge/testes%20do%20scanner-34%20aprovados-38A169)
 
-O reconhecimento usa Dart e a biblioteca `image`. Não envia fotografias a uma API de leitura e não depende de um servidor Python. Login, consulta de provas/alunos e persistência continuam usando Firebase.
+[Como funciona](#como-funciona) · [Recursos](#recursos) · [Leitura local](#leitura-local) · [Testes](#testes-e-integração) · [Arquitetura do scanner](docs/scanner.md)
+
+</div>
+
+## Como funciona
+
+```mermaid
+flowchart LR
+    A["Cadastrar turma,<br/>alunos e gabarito"] --> B["Gerar folha A4<br/>com QR Code"]
+    B --> C["Ler o QR e<br/>fotografar a folha"]
+    C --> D["OMR no aparelho<br/>perspectiva · orientação · marcações"]
+    D --> E["Revisar respostas<br/>duvidosas destacadas"]
+    E --> F["Salvar nota<br/>do aluno"]
+```
+
+<table>
+  <tr>
+    <td width="42%"><img src="tests/fixtures/printed_sheet.png" alt="Folha de respostas gerada pelo aplicativo, com 50 questões, QR Code e marcadores nos cantos"></td>
+    <td>
+      <b>A folha que o próprio app gera</b><br><br>
+      Os quatro quadrados dos cantos permitem corrigir a perspectiva da foto; um padrão adicional
+      identifica a orientação. O QR Code amarra a folha à prova e ao aluno, e o gerador de PDF e o
+      leitor compartilham a mesma definição de posições (<code>scanner/sheet_layout.dart</code>).<br><br>
+      <sub>Imagem renderizada a partir do PDF real gerado pelo aplicativo, usada também nos testes.</sub>
+    </td>
+  </tr>
+</table>
+
+<!--
+CAPTURAS DO APLICATIVO
+Salve prints do celular em docs/images/ com estes nomes e remova este comentário:
+
+<p align="center">
+  <img src="docs/images/dashboard.png" width="230" alt="Painel com turmas e provas">
+  <img src="docs/images/scanner.png" width="230" alt="Câmera lendo a folha de respostas">
+  <img src="docs/images/revisao.png" width="230" alt="Revisão das respostas reconhecidas">
+  <img src="docs/images/resultados.png" width="230" alt="Resultados e estatísticas da prova">
+</p>
+-->
 
 ## Recursos
 
@@ -21,6 +65,8 @@ O reconhecimento usa Dart e a biblioteca `image`. Não envia fotografias a uma A
 
 **Tecnologias:** Flutter · Dart · Firebase · `image` · `camera` · `mobile_scanner` · `pdf`.
 
+O reconhecimento usa Dart e a biblioteca `image`: não envia fotografias a uma API de leitura e não depende de um servidor Python. Login, consulta de provas/alunos e persistência usam Firebase.
+
 Para explorar o código, comece pela [arquitetura do scanner](docs/scanner.md) ou pelos [testes de reconhecimento](tests/scanner_test.dart).
 
 ## Como usar
@@ -32,10 +78,6 @@ Para explorar o código, comece pela [arquitetura do scanner](docs/scanner.md) o
 5. Confirme a revisão, selecione/confirme o aluno e salve.
 
 **Folhas antigas precisam ser geradas novamente.** O modelo `local-v1` tem posições fixas para até 50 questões e cinco alternativas. QRs antigos, de outras versões ou de provas cuja quantidade de questões mudou são recusados. Folhas avulsas sem prova cadastrada podem ser impressas, mas não têm correção automática.
-
-<img src="tests/fixtures/printed_sheet.png" alt="Modelo de folha local com 50 questões" width="360">
-
-*Folha demonstrativa renderizada a partir do PDF gerado pelo aplicativo.*
 
 ## Leitura local
 
