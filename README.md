@@ -8,6 +8,13 @@ Correção de provas objetivas com leitura da folha **no próprio celular**. O s
 
 O reconhecimento usa Dart e a biblioteca `image`. Não envia fotografias a uma API de leitura e não depende de um servidor Python. Login, consulta de provas/alunos e persistência continuam usando Firebase.
 
+## Leitura rápida do projeto
+
+- **Foco:** processamento de imagens em Dart, leitura óptica de marcações e revisão humana.
+- **Evidência técnica:** [arquitetura do scanner](docs/scanner.md), [reconhecimento local](scanner/local_omr.dart) e [testes de leitura](tests/scanner_test.dart).
+- **Para avaliar:** execute o [scanner isoladamente](#testes-e-integração) e consulte os casos de perspectiva, orientação e marcações ambíguas.
+- **Estado:** este repositório contém fontes equivalentes a `lib/` e não executa `flutter run` diretamente. A aplicação completa depende das plataformas e da configuração Firebase do projeto original. Os testes sintéticos não medem acurácia em fotos reais.
+
 ## Recursos
 
 | Etapa | O que o aplicativo oferece |
